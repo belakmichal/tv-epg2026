@@ -2,7 +2,8 @@ name: Update EPG
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    # EPGShare01 normally publishes around 07:45 UTC; 09:00 UTC gets the fresh files.
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 permissions:
@@ -11,48 +12,117 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download and merge SK, CZ, HU EPG
+      - name: Build filtered merged EPG
         run: |
-          python3 -c '
+          python3 - <<'PY'
           import gzip
           import urllib.request
           import xml.etree.ElementTree as ET
 
-          urls = [
+          SOURCES = [
               "https://epgshare01.online/epgshare01/epg_ripper_SK1.xml.gz",
               "https://epgshare01.online/epgshare01/epg_ripper_CZ1.xml.gz",
               "https://epgshare01.online/epgshare01/epg_ripper_HU1.xml.gz",
           ]
+          CHANNELS_FILE = "channels.txt"
+          OUTPUT_FILE = "epg.xml.gz"
 
-          root = ET.Element("tv")
-          seen = set()
+          allowed = set()
+          with open(CHANNELS_FILE, encoding="utf-8") as channels_file:
+              for line in channels_file:
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      allowed.add(line)
 
-          for url in urls:
-              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-              raw = gzip.decompress(urllib.request.urlopen(req, timeout=60).read())
-              tree = ET.fromstring(raw)
+          print(f"Allowed channel IDs: {len(allowed)}")
 
-              for channel in tree.findall("channel"):
-                  cid = channel.attrib.get("id")
-                  if cid and cid not in seen:
-                      seen.add(cid)
+          root = ET.Element(
+              "tv",
+              {
+                  "generator-info-name": "tv-epg2026 filtered merge",
+                  "generator-info-url": "https://github.com/belakmichal/tv-epg2026",
+              },
+          )
+          seen_channels = set()
+          seen_programmes = set()
+
+          for url in SOURCES:
+              request = urllib.request.Request(
+                  url, headers={"User-Agent": "Mozilla/5.0"}
+              )
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  source = ET.fromstring(gzip.decompress(response.read()))
+
+              added_channels = 0
+              added_programmes = 0
+
+              for channel in source.findall("channel"):
+                  channel_id = channel.get("id")
+                  if channel_id in allowed and channel_id not in seen_channels:
+                      seen_channels.add(channel_id)
                       root.append(channel)
+                      added_channels += 1
 
-              for programme in tree.findall("programme"):
+              for programme in source.findall("programme"):
+                  channel_id = programme.get("channel")
+                  if channel_id not in allowed:
+                      continue
+                  key = (
+                      channel_id,
+                      programme.get("start"),
+                      programme.get("stop"),
+                  )
+                  if key in seen_programmes:
+                      continue
+                  seen_programmes.add(key)
                   root.append(programme)
+                  added_programmes += 1
 
-          with gzip.open("epg.xml.gz", "wb") as f:
-              f.write(ET.tostring(root, encoding="utf-8", xml_declaration=True))
-          '
+              print(
+                  f"{url}: +{added_channels} channels, "
+                  f"+{added_programmes} programmes"
+              )
+
+          missing = sorted(allowed - seen_channels)
+          print(
+              f"Result: {len(seen_channels)} channels, "
+              f"{len(seen_programmes)} programmes"
+          )
+          if missing:
+              print("IDs from channels.txt not found in the EPG sources:")
+              for channel_id in missing:
+                  print(f"  {channel_id}")
+
+          if not seen_channels:
+              raise SystemExit(
+                  "No matching channels found; refusing to write an empty EPG"
+              )
+
+          with open(OUTPUT_FILE, "wb") as file_handle:
+              with gzip.GzipFile(
+                  fileobj=file_handle, mode="wb", mtime=0
+              ) as gzip_file:
+                  gzip_file.write(
+                      ET.tostring(
+                          root, encoding="utf-8", xml_declaration=True
+                      )
+                  )
+          PY
+          ls -lh epg.xml.gz
 
       - name: Commit and push merged EPG
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add epg.xml.gz
-          git commit -m "Update EPG" || exit 0
+          if git diff --cached --quiet; then
+            echo "No EPG changes"
+            exit 0
+          fi
+          git commit -m "Update EPG"
           git push
